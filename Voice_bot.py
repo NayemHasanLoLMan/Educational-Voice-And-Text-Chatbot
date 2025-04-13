@@ -901,12 +901,12 @@ def analyze_language_errors(text, level):
             {
                 "role": "system",
                 "content": f"""Analyze the text from a level {level}/10 English learner and identify up to 3 grammar or vocabulary errors.
-Return ONLY a JSON array, like:
-[
-  {{"error_type": "grammar", "error": "I don't like it.", "correction": "I don't like that."}},
-  ...
-]
-"""},
+                Return ONLY a JSON array, like:
+                [
+                {{"error_type": "grammar", "error": "I don't like it.", "correction": "I don't like that."}},
+                ...
+                ]
+                """},
             {"role": "user", "content": text}
         ]
         response = openai.ChatCompletion.create(
@@ -1263,34 +1263,34 @@ def generate_learning_report():
     recent_errors = session_data['errors'][-3:] if session_data['errors'] else []
 
     prompt = f"""
-You are an English language tutor summarizing a short voice-based learning session.
+            You are an English language tutor summarizing a short voice-based learning session.
 
-🧾 Session Summary:
-- Duration: {session_data['duration']} min
-- Exchanges: {session_data['exchanges']}
-- Detected Level: {session_data['level']}/10
+            🧾 Session Summary:
+            - Duration: {session_data['duration']} min
+            - Exchanges: {session_data['exchanges']}
+            - Detected Level: {session_data['level']}/10
 
-🎯 Analytics:
-- Avg Pronunciation Score: {avg_pronunciation:.2f}
-- Avg Fluency Score: {avg_fluency:.2f}
-- Avg Speech Rate: {avg_speech_rate:.1f} words/sec
+            🎯 Analytics:
+            - Avg Pronunciation Score: {avg_pronunciation:.2f}
+            - Avg Fluency Score: {avg_fluency:.2f}
+            - Avg Speech Rate: {avg_speech_rate:.1f} words/sec
 
-🧪 Most Recent Test:
-{f"- Score: {latest_test.get('score', 'N/A')}/5" if latest_test else "- No test taken"}
-{f"- Feedback: {latest_test.get('feedback', '')}" if latest_test else ""}
+            🧪 Most Recent Test:
+            {f"- Score: {latest_test.get('score', 'N/A')}/5" if latest_test else "- No test taken"}
+            {f"- Feedback: {latest_test.get('feedback', '')}" if latest_test else ""}
 
-✅ Strengths:
-{', '.join(session_data['strengths']) if session_data['strengths'] else "N/A"}
+            ✅ Strengths:
+            {', '.join(session_data['strengths']) if session_data['strengths'] else "N/A"}
 
-🔧 Needs Improvement:
-{', '.join(session_data['improvement_areas']) if session_data['improvement_areas'] else "N/A"}
+            🔧 Needs Improvement:
+            {', '.join(session_data['improvement_areas']) if session_data['improvement_areas'] else "N/A"}
 
-📝 Common Issues:
-{json.dumps(recent_errors, indent=2) if recent_errors else "No significant recurring errors."}
+            📝 Common Issues:
+            {json.dumps(recent_errors, indent=2) if recent_errors else "No significant recurring errors."}
 
-🎁 Final Tip:
-Give the student 1 sentence of encouragement or next steps.
-"""
+            🎁 Final Tip:
+            Give the student 1 sentence of encouragement or next steps.
+            """
 
     try:
         response = openai.ChatCompletion.create(

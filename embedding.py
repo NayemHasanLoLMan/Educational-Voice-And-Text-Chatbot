@@ -1,171 +1,299 @@
-
 import os
-import fitz  # PyMuPDF
-import pdfplumber
-from PIL import Image, ImageEnhance, ImageFilter
+import fitz  # PyMuPDF for PDF processing
+import numpy as np
+import json
+import openai
+import logging
+import time
+import unicodedata
+from typing import Dict, Tuple
+import dotenv
 import pytesseract
-from tqdm import tqdm
-from typing import List
+from PIL import Image
+import io
+import fasttext
+import re
 
-class CombinedAmharicTextExtractor:
-    def __init__(self, file_paths: List[str]):
-        self.file_paths = file_paths
-        print(f"Initialized extractor for {len(file_paths)} files")
+dotenv.load_dotenv()
 
-        # Configure pytesseract
-        try:
-            # For Windows
-            if os.name == 'nt':
-                pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-            # For Linux/Mac, it's usually in PATH
-            else:
-                pytesseract.pytesseract.tesseract_cmd = r"tesseract"
-            print("Tesseract OCR initialized successfully.")
-            self.tesseract_available = True
-        except Exception as e:
-            print(f"Error configuring Tesseract OCR: {e}. OCR fallback will be skipped.")
-            self.tesseract_available = False
+# Setup logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-    def preprocess_image(self, img: Image.Image) -> Image.Image:
-        """Enhanced preprocessing for better OCR on math books with Amharic text."""
-        img = img.convert("L")  # Convert to grayscale
-        img = ImageEnhance.Sharpness(img).enhance(2.5)  # Increased sharpness for Amharic
-        img = ImageEnhance.Contrast(img).enhance(2.8)   # Increased contrast for better definition
-        img = img.filter(ImageFilter.MedianFilter(size=3))  # Remove noise
-        img = img.point(lambda x: 0 if x < 120 else 255, "1")  # Lower threshold for Amharic scripts
-        return img
+# Create file handler
+file_handler = logging.FileHandler("pdf_embedding.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-    def normalize_amharic_text(self, text: str) -> str:
-        """Post-processing for Amharic text to improve quality."""
-        if not text:
-            return text
-            
-        # Remove extra whitespaces
-        text = ' '.join(text.split())
+# Create stream handler with UTF-8 encoding
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Add handlers to logger
+logger.handlers = [file_handler, stream_handler]
+
+# Load fasttext language detection model
+fasttext_model = None
+try:
+    fasttext_model_path = "lid.176.bin"
+    if not os.path.exists(fasttext_model_path):
+        raise FileNotFoundError(f"FastText model file not found at {fasttext_model_path}")
+    fasttext_model = fasttext.load_model(fasttext_model_path)
+    logger.info("FastText model loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load FastText model: {str(e)}. Using Ethiopic script fallback for Amharic detection.")
+
+class BatchPDFVectorizerOpenAI:
+    def __init__(self, folder_path: str):
+        """Initialize the BatchPDFVectorizer with a folder path and OpenAI API key from environment."""
+        if not os.path.exists(folder_path):
+            raise FileNotFoundError(f"Folder not found at: {folder_path}")
         
-        # Replace common OCR errors in Amharic text
-        replacements = {
-            '0': '፩',  # Example replacement, adjust based on actual OCR errors
-            '1': '፩',
-            '2': '፪',
-            '3': '፫',
-            # Add more replacements as needed
-        }
-        
-        for old, new in replacements.items():
-            text = text.replace(old, new)
+        self.folder_path = folder_path
+        self.embedding_model = "text-embedding-3-small"
+        openai.api_key = os.getenv("OPENAI_API_KEY")
 
-        return text
-
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from a PDF using multiple methods."""
-        if not os.path.exists(pdf_path):
-            print(f"Error: PDF file '{pdf_path}' not found.")
-            return ""
-
-        all_text = f"\n\n==== {os.path.basename(pdf_path)} ====\n\n"
+        if not openai.api_key:
+            raise EnvironmentError("OPENAI_API_KEY not found in environment variables.")
         
-        # Try to extract text directly first (for selectable text)
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
-                    print(f"Extracting selectable text from page {page_num}/{len(pdf.pages)}")
-                    page_text = page.extract_text()
-                    if page_text and page_text.strip():
-                        normalized_text = self.normalize_amharic_text(page_text)
-                        all_text += f"--- Page {page_num} ---\n{normalized_text}\n\n"
-        except Exception as e:
-            print(f"Warning: pdfplumber extraction failed: {e}")
-        
-        # Try PyMuPDF as another method for selectable text
+        self.embedding_dimension = None
+        logger.info(f"Initialized OpenAI client with embedding model: {self.embedding_model}")
+
+    def extract_text_from_pdf(self, pdf_path: str) -> Dict[int, str]:
+        """Extract text from each page of a PDF file, including OCR for images."""
+        page_dict = {}
         try:
             doc = fitz.open(pdf_path)
             for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
-                page_text = page.get_text("text")
-                # Only add text if pdfplumber didn't get it
-                if page_text and page_text.strip() and f"--- Page {page_num+1} ---" not in all_text:
-                    normalized_text = self.normalize_amharic_text(page_text)
-                    all_text += f"--- Page {page_num+1} ---\n{normalized_text}\n\n"
+                page = doc[page_num]
+                # Try native text extraction
+                text = page.get_text().strip()
+                
+                # If little or no text, try OCR
+                if not text or len(text) < 50:
+                    logger.debug(f"Low text content on page {page_num+1} of {pdf_path}. Attempting OCR.")
+                    ocr_text = self.ocr_page(page, page_num)
+                    text = ocr_text if ocr_text else text
+                
+                if text.strip():
+                    page_dict[page_num + 1] = text.strip()
+                else:
+                    logger.warning(f"No usable text extracted for page {page_num+1} of {pdf_path}")
+            
             doc.close()
+            logger.info(f"Extracted {len(page_dict)} pages from {pdf_path}.")
         except Exception as e:
-            print(f"Warning: PyMuPDF extraction failed: {e}")
-        
-        # For non-selectable text, use OCR
-        pages_with_text = set()
-        for line in all_text.split("\n"):
-            if line.startswith("--- Page "):
-                try:
-                    page_number = int(line.split("---")[1].strip().split(" ")[1])
-                    pages_with_text.add(page_number)
-                except (ValueError, IndexError):
-                    pass
-        
-        # Only do OCR on pages that don't have text yet
-        if self.tesseract_available:
-            try:
-                doc = fitz.open(pdf_path)
-                total_pages = len(doc)
-                
-                for page_num in range(total_pages):
-                    # Skip if we already have text for this page
-                    if page_num + 1 in pages_with_text:
-                        print(f"Skipping OCR for page {page_num+1} - already has text")
-                        continue
-                        
-                    print(f"Performing OCR on page {page_num+1}/{total_pages}")
-                    page = doc.load_page(page_num)
-                    pix = page.get_pixmap(dpi=600)  # Higher DPI for Amharic
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    img = self.preprocess_image(img)
-                    
-                    # Try different PSM modes
-                    best_text = ""
-                    for psm in [6, 3, 11]:
-                        custom_config = f'--oem 3 --psm {psm} -l eng+amh+equ'
-                        page_text = pytesseract.image_to_string(img, config=custom_config)
-                        if len(page_text.strip()) > len(best_text.strip()):
-                            best_text = page_text
-                    
-                    if best_text.strip():
-                        normalized_text = self.normalize_amharic_text(best_text)
-                        all_text += f"--- Page {page_num+1} (OCR) ---\n{normalized_text}\n\n"
-                
-                doc.close()
-            except Exception as e:
-                print(f"Warning: OCR processing failed: {e}")
-        
-        return all_text
+            logger.error(f"Error extracting text from {pdf_path}: {str(e)}")
+        return page_dict
 
-    def extract_all_to_single_file(self, output_path: str):
-        """Extract text from all PDFs and combine into one file."""
-        print(f"Starting extraction of {len(self.file_paths)} files to single output: {output_path}")
-        
-        combined_text = "COMBINED AMHARIC TEXT EXTRACTION\n\n"
-        
-        for pdf_path in self.file_paths:
-            print(f"\n=== Processing: {pdf_path} ===")
-            pdf_text = self.extract_text_from_pdf(pdf_path)
-            combined_text += pdf_text
-            combined_text += "\n" + "=" * 80 + "\n\n"
-        
-        # Write all text to a single file
+    def ocr_page(self, page, page_num: int) -> str:
+        """Perform OCR on a PDF page by converting it to an image."""
         try:
-            with open(output_path, "w", encoding="utf-8") as output_file:
-                output_file.write(combined_text)
-            print(f"\nSuccessfully saved all extracted text to {output_path}")
-            return True
+            # Convert page to image
+            pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72))  # Reduced DPI to save memory
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Perform OCR with Tesseract, specifying Amharic and English
+            text = pytesseract.image_to_string(img, lang="amh+eng", config='--psm 6')
+            cleaned_text = text.strip()
+            
+            if cleaned_text:
+                logger.debug(f"OCR extracted {len(cleaned_text)} characters for page {page_num+1}")
+                return cleaned_text
+            else:
+                logger.warning(f"OCR found no text for page {page_num+1}")
+                return ""
         except Exception as e:
-            print(f"Error saving combined text: {e}")
-            return False
+            logger.error(f"OCR error on page {page_num+1}: {str(e)}")
+            return ""
 
-# Usage Example
+    def detect_language_and_normalize(self, text: str) -> str:
+        """Detect language with fasttext and normalize if Amharic."""
+        if not text or len(text.strip()) < 5:
+            logger.debug("Text too short for language detection. Returning original.")
+            return text
+        
+        # Check for Ethiopic script as a heuristic for Amharic
+        ethiopic_pattern = re.compile(r'[\u1200-\u137F]')
+        has_ethiopic = bool(ethiopic_pattern.search(text))
+        
+        if has_ethiopic:
+            logger.debug("Detected Ethiopic script. Assuming Amharic.")
+            return unicodedata.normalize("NFKC", text)
+        
+        # Use fasttext for language detection
+        if fasttext_model:
+            try:
+                # Clean text for fasttext (replace newlines, multiple spaces)
+                clean_text = " ".join(text.split())
+                if len(clean_text) < 5:
+                    logger.debug("Cleaned text too short for fasttext. Returning original.")
+                    return text
+                
+                predictions = fasttext_model.predict(clean_text, k=1)
+                lang = predictions[0][0].replace('__label__', '')
+                
+                if lang == "am":
+                    logger.debug("Fasttext detected Amharic. Applying Unicode normalization.")
+                    return unicodedata.normalize("NFKC", text)
+                logger.debug(f"Fasttext detected language: {lang}")
+                return text
+            except Exception as e:
+                logger.warning(f"Fasttext detection failed: {str(e)}. Assuming English.")
+                return text
+        else:
+            logger.debug("Fasttext unavailable. Assuming English for non-Ethiopic text.")
+            return text
+
+    def get_embedding_with_retry(self, text: str, max_retries=3, backoff_factor=2):
+        """Get embedding with retry logic for API failures."""
+        for attempt in range(max_retries):
+            try:
+                response = openai.Embedding.create(
+                    model=self.embedding_model,
+                    input=text
+                )
+                # Use np.asarray to avoid NumPy 2.0 copy warning
+                embedding = np.asarray(response['data'][0]['embedding'])
+                
+                if self.embedding_dimension is None:
+                    self.embedding_dimension = embedding.shape[0]
+                    logger.info(f"Detected embedding dimension: {self.embedding_dimension}")
+                
+                return embedding
+            except Exception as e:
+                wait_time = backoff_factor ** attempt
+                logger.warning(f"Embedding API error (attempt {attempt+1}/{max_retries}): {str(e)}")
+                logger.warning(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+        
+        logger.error(f"Failed to get embedding after {max_retries} attempts")
+        if self.embedding_dimension is None:
+            self.embedding_dimension = 1536  # Default for text-embedding-3-small
+        return np.zeros(self.embedding_dimension)
+
+    def vectorize_pages(self, pdf_path: str) -> Tuple[Dict[int, np.ndarray], Dict[int, str]]:
+        """Generate vector embeddings for each page using OpenAI Embedding API."""
+        page_dict = self.extract_text_from_pdf(pdf_path)
+        page_embeddings = {}
+
+        logger.info(f"Starting vectorization for {pdf_path} with {len(page_dict)} pages")
+        for page_num, text in page_dict.items():
+            if len(text) < 10:
+                logger.warning(f"Skipping Page {page_num} in {pdf_path}: content too short ({len(text)} chars)")
+                continue
+
+            try:
+                logger.debug(f"Page {page_num} text sample: {text[:50]}")
+                normalized_text = self.detect_language_and_normalize(text)
+                if not normalized_text.strip():
+                    logger.warning(f"Empty normalized text for Page {page_num} in {pdf_path}")
+                    continue
+                truncated_text = normalized_text[:8000]  # Approx token limit safe zone
+                logger.debug(f"Processing Page {page_num}: {len(truncated_text)} chars")
+                embedding = self.get_embedding_with_retry(truncated_text)
+                if embedding is None or not embedding.any():
+                    logger.error(f"Invalid embedding for Page {page_num} in {pdf_path}")
+                    continue
+                page_embeddings[page_num] = embedding
+                logger.info(f"Generated embedding for Page {page_num} in {pdf_path}, shape: {embedding.shape}")
+            except Exception as e:
+                logger.error(f"Failed to process Page {page_num} in {pdf_path}: {str(e)}")
+                continue
+        
+        logger.info(f"Completed vectorization for {pdf_path}: {len(page_embeddings)} embeddings generated")
+        return page_embeddings, page_dict
+
+    def process_all_files(self, base_output_dir: str):
+        """Process PDFs in all subfolders and save each PDF's embeddings separately."""
+        logger.info(f"Starting processing of PDFs in {self.folder_path}")
+        for root, _, files in os.walk(self.folder_path):
+            for file_name in files:
+                if not file_name.lower().endswith(".pdf"):
+                    continue
+
+                file_path = os.path.join(root, file_name)
+                # Clean relative path to avoid '.\' prefix
+                relative_dir = os.path.relpath(root, self.folder_path)
+                if relative_dir == ".":
+                    relative_dir = ""
+                output_subdir = os.path.join(base_output_dir, relative_dir)
+                os.makedirs(output_subdir, exist_ok=True)
+
+                output_filename = f"{os.path.splitext(file_name)[0]}_embedding.npz"
+                output_path = os.path.join(output_subdir, output_filename)
+
+                logger.info(f"Processing: {file_path}")
+                try:
+                    page_embeddings, page_texts = self.vectorize_pages(file_path)
+
+                    if not page_embeddings:
+                        logger.warning(f"No embeddings generated for {file_name}")
+                        continue
+
+                    file_embeddings = {}
+                    file_metadata = {}
+
+                    for page_num, embedding in page_embeddings.items():
+                        page_id = f"page_{page_num}"
+                        file_embeddings[page_id] = embedding
+                        file_metadata[page_id] = {
+                            "file_name": file_name,
+                            "page_number": page_num,
+                            "text": page_texts.get(page_num, "")[:1000],
+                            "char_count": len(page_texts.get(page_num, ""))
+                        }
+
+                    self.save_combined_embeddings(file_embeddings, file_metadata, output_path)
+
+                except Exception as e:
+                    logger.error(f"Error processing {file_name}: {str(e)}")
+                    continue
+        logger.info("Completed processing all PDFs")
+
+    def save_combined_embeddings(self, embeddings: Dict[str, np.ndarray], 
+                                metadata: Dict[str, Dict], output_path: str):
+        """Save all embeddings and metadata to a single file."""
+        if not embeddings:
+            raise ValueError("No embeddings to save")
+            
+        page_ids = list(embeddings.keys())
+        first_dim = embeddings[page_ids[0]].shape[0]
+
+        for page_id in page_ids:
+            if embeddings[page_id].shape[0] != first_dim:
+                logger.error(f"Inconsistent embedding dimensions: {page_id} has {embeddings[page_id].shape[0]}, expected {first_dim}")
+                embeddings[page_id] = np.resize(embeddings[page_id], (first_dim,))
+
+        embedding_array = np.stack([embeddings[page_id] for page_id in page_ids], axis=0)
+
+        try:
+            np.savez(
+                output_path,
+                page_ids=page_ids,
+                embeddings=embedding_array,
+                metadata=json.dumps(metadata, ensure_ascii=False)
+            )
+            if os.path.exists(output_path):
+                size = os.path.getsize(output_path) / (1024 * 1024)
+                logger.info(f"Saved {len(page_ids)} page embeddings to {output_path} ({size:.2f} MB)")
+            else:
+                logger.error(f"File not created at {output_path}")
+        except Exception as e:
+            logger.error(f"Failed saving .npz file: {e}")
+            raise
+
+def main():
+    FOLDER_PATH = r"D:\\Len project PDF\\Grade 1"
+    OUTPUT_DIR = r"D:\\Len project PDF\\Grade 1 Embedded"
+
+    try:
+        vectorizer = BatchPDFVectorizerOpenAI(FOLDER_PATH)
+        vectorizer.process_all_files(OUTPUT_DIR)
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user")
+    except Exception as e:
+        logger.critical(f"Critical error during vectorization: {str(e)}", exc_info=True)
+
 if __name__ == "__main__":
-    FILE_PATHS = [
-            "1ኛ ክፍል አካባቢ ሳይንስ መጽሐፍ - ምዕራፍ 3.pdf"
-    ]
-    
-    OUTPUT_FILE = "all_text.txt"
-    
-    extractor = CombinedAmharicTextExtractor(FILE_PATHS)
-    extractor.extract_all_to_single_file(OUTPUT_FILE)
+    main()
