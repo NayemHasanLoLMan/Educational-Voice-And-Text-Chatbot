@@ -284,8 +284,8 @@ class BatchPDFVectorizerOpenAI:
             raise
 
 def main():
-    FOLDER_PATH = r"D:\\Len project PDF\\Grade 1"
-    OUTPUT_DIR = r"D:\\Len project PDF\\Grade 1 Embedded"
+    FOLDER_PATH = r"D:\\Len project PDF\\Grade 4"
+    OUTPUT_DIR = r"D:\\Len project PDF\\Grade 4 Embedded"
 
     try:
         vectorizer = BatchPDFVectorizerOpenAI(FOLDER_PATH)
