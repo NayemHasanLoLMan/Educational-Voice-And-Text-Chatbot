@@ -41,7 +41,7 @@ AUDIO_FILENAME = "user_audio.wav"
 
 # Memory for conversation
 CONVERSATION_HISTORY = []
-MAX_HISTORY = 10  # Increased for better context
+MAX_HISTORY = 12  # Increased for better context
 
 # Initialize pygame mixer for console audio playback
 pygame.mixer.init()
@@ -49,37 +49,41 @@ pygame.mixer.init()
 # Path to NPZ file
 NPZ_FILE = r"D:\\Len project PDF\\Grade 1 Embedded\\grade 1-amharic_ethiofetenacom_8050_embedding.npz"
 
-# Ethiopian Education System Prompt
+# Ethiopian Education System Prompt - Updated for better conversation handling
 ETHIOPIAN_EDUCATION_PROMPT = """
 You are an expert Ethiopian teacher for **{subject}** in **Grade {grade}**, following the national curriculum. Use the provided knowledge base file: **{knowledge_base_file}** to give accurate, detailed answers. Incorporate conversation history for context and explain concepts clearly for young learners.
 
 🧠 Instructions:
 1. **Use Knowledge Base**: Base answers on **{knowledge_base_file}**. Use multiple relevant pages for rich context. If insufficient, use general knowledge aligned with the Ethiopian curriculum for **{subject}**, **Grade {grade}**.
-2. **Conversation History**: Reference previous queries to maintain context, especially for follow-up questions like "explain in detail."
+2. **Conversation History**: ALWAYS check previous messages to maintain context. If the user asks for more explanation, clarification, or uses words like "explain", "previous", or "details", provide more detailed information about the previous topic.
 3. **Response Structure**:
-   - Simple, friendly Amharic explanation first, suitable for Grade {grade}.
-   - Detailed English translation second, including explanations.
-   - Format:
+   - ALWAYS provide your response in two distinctly separate sections:
+   - First section: Simple, friendly Amharic explanation, suitable for Grade {grade}.
+   - Second section: Detailed English translation of the Amharic text (not just a direct translation but culturally appropriate).
+   - ALWAYS format exactly as:
      አማርኛ መልስ፡ [Amharic explanation]
+     
      English: [English explanation]
 4. **Guidelines**:
    - Age-appropriate for Grade {grade}.
    - Simple Amharic vocabulary with Ethiopian cultural examples.
-   - For vague queries, infer intent from history or provide partial answers.
-   - When "explain" is requested, include details (e.g., letter sounds, word usage).
+   - For vague queries like "explain" or "details", refer to the most recent topic and expand on it.
+   - When "explain" is requested, include more details about the previous answer.
    - Stay within **{subject}**.
+   - For greetings or general questions outside the curriculum, respond appropriately while maintaining your role as an Ethiopian teacher.
 
-💡 Example for Amharic, Grade 1:
-Q: Write words starting with "ለ":
-አማርኛ መልስ፡ “ለ” መነሻ ቃላት፡ “ላም” ማለት ላም፣ “ለባ” ማለት ሌባ ነው።
-English: Words starting with “ለ”: “ላም” means cow, “ለባ” means thief. These are common words taught in Grade 1 to practice the letter “ለ.”
+💡 Follow-up Request Handling:
+- When user asks "explain", "more details", or similar requests, always refer to your previous answer and elaborate with more information, examples, or context.
+- If the user mentions "previous answer" in any language, identify what was previously discussed and give a more detailed explanation of it.
 
 ✅ Answers must:
 - Be Grade {grade} appropriate
 - Follow Ethiopian curriculum
 - Use clear, simple examples
 - Avoid Western references
+- Avoid western culture references
 - Provide detailed explanations when requested
+- ALWAYS include both Amharic and English sections with the exact format specified above
 """
 
 # Load fasttext language detection model
@@ -208,6 +212,31 @@ def extract_fidels(word: str) -> list:
             fidels.append(char)
     return fidels
 
+def handle_previous_reference(user_input):
+    """Handle references to previous content in the conversation."""
+    previous_terms = ["previous", "privious", "last", "before", "earlier", "ቀዳሚ", "ቀደም", "ያለፈ"]
+    
+    if any(term in user_input.lower() for term in previous_terms) and len(CONVERSATION_HISTORY) >= 4:
+        # Get the last substantive QA pair
+        last_question = None
+        last_answer = None
+        
+        for i in range(len(CONVERSATION_HISTORY)-3, -1, -2):
+            if CONVERSATION_HISTORY[i]["role"] == "user" and i+1 < len(CONVERSATION_HISTORY):
+                last_question = CONVERSATION_HISTORY[i]["content"]
+                last_answer = CONVERSATION_HISTORY[i+1]["content"]
+                break
+        
+        if last_question and last_answer:
+            return True, last_question, last_answer
+    
+    return False, None, None
+
+def is_follow_up_question(user_input):
+    """Determine if input is a follow-up question."""
+    follow_up_indicators = ["explain", "detail", "previous", "privious", "tell me more", "elaborate", "expline"]
+    return any(indicator in user_input.lower() for indicator in follow_up_indicators)
+
 def chat_with_ai(user_input: str, knowledge_base: list, subject: str, grade: str, knowledge_base_file: str, top_k: int = 3):
     """Process user input and generate a response using the NPZ knowledge base."""
     try:
@@ -218,48 +247,47 @@ def chat_with_ai(user_input: str, knowledge_base: list, subject: str, grade: str
             knowledge_base_file=knowledge_base_file
         )
 
-        # Handle generic or unclear inputs
-        if not user_input.strip() or user_input.lower() in ["hello", "hi", "what do you know", "what do you know?"]:
-            return (
-                f"አማርኛ መልስ፡ ሰላም! እኔ የ{subject} መምህር ነኝ ለክፍል {grade}። ለምሳሌ፣ ስለ ፊደላት ጥያቄ መጠየቅ ትፈልጋለህ?",
-                f"English: Hello! I am a {subject} teacher for Grade {grade}. For example, would you like to ask about letters?"
-            )
+        # Check if this is a reference to previous content
+        is_previous_reference, prev_question, prev_answer = handle_previous_reference(user_input)
+        
+        # Check if this is a follow-up question
+        follow_up = is_follow_up_question(user_input)
+        
+        if is_previous_reference:
+            # Make the context explicit to the model
+            user_input = f"The user is asking for more details about their previous question: '{prev_question}' which you answered with: '{prev_answer}'. Please provide a more detailed explanation."
+            print("Detected reference to previous content. Enhancing context.")
+        elif follow_up and len(CONVERSATION_HISTORY) >= 2:
+            # Find the last question to provide context
+            last_question = None
+            for entry in reversed(CONVERSATION_HISTORY):
+                if entry["role"] == "user" and entry["content"] != user_input:
+                    last_question = entry["content"]
+                    break
+            
+            if last_question:
+                user_input = f"The user asked '{user_input}' as a follow-up to their question: '{last_question}'. Please provide more detailed information about the previous topic."
+                print("Detected follow-up question. Enhancing context.")
 
         # Handle specific tasks directly
         if "ፊደላት በቅደም ተከተል" in user_input:
-            # Extract word from query (e.g., “ተማሪ”)
-            match = re.search(r'“([^”]+)”', user_input)
+            # Extract word from query (e.g., "ተማሪ")
+            match = re.search(r'"([^"]+)"', user_input)
             if match:
                 word = match.group(1)
                 fidels = extract_fidels(word)
                 fidel_str = ", ".join(fidels)
-                return (
-                    f"አማርኛ መልስ፡ ቃል “{word}” ፊደላት በቅደም ተከተል፡ {fidel_str} ናቸው።",
-                    f"English: The letters of the word “{word}” in order are: {fidel_str}."
-                )
-
-        # Handle "explain" requests
-        if "explain" in user_input.lower():
-            # Check history for context
-            last_query = None
-            for entry in reversed(CONVERSATION_HISTORY):
-                if entry["role"] == "user" and "ፊደላት" not in user_input:
-                    last_query = entry["content"]
-                    break
-            if last_query:
-                match = re.search(r'“([^”]+)”', last_query)
-                if match:
-                    word = match.group(1)
-                    fidels = extract_fidels(word)
-                    fidel_str = ", ".join(fidels)
-                    return (
-                        f"አማርኛ መልስ፡ ቃል “{word}” ፊደላት በቅደም ተከተል፡ {fidel_str} ናቸው። እያንዳንዱ ፊደል የራሱ ድምፅ አለው። ለምሳሌ፡ “{fidels[0]}” በ“{word}” ውስጥ የመጀመሪያ ድምፅ ነው። ቃሉ ትርጉሙ “ተማሪ” ማለት ተማሪ ወይም የሚማር ሰው ነው።",
-                        f"English: The word “{word}” has letters: {fidel_str}. Each letter has its own sound. For example, “{fidels[0]}” is the first sound in “{word}”. The word “ተማሪ” means student or learner."
-                    )
-            return (
-                f"አማርኛ መልስ፡ ምንን ማብራራት እንዳለብኝ እባክህ ግለጽ። ለምሳሌ፡ ስለ ፊደላት ወይም ቃላት መጠየቅ ትችላለህ።",
-                f"English: Please clarify what to explain. For example, you can ask about letters or words."
-            )
+                amharic_text = f'ቃል "{word}" ፊደላት በቅደም ተከተል፡ {fidel_str} ናቸው።'
+                english_text = f'The letters of the word "{word}" in order are: {fidel_str}.'
+                
+                # Update conversation history
+                CONVERSATION_HISTORY.append({"role": "user", "content": user_input})
+                CONVERSATION_HISTORY.append({
+                    "role": "assistant", 
+                    "content": f"አማርኛ መልስ፡ {amharic_text}\n\nEnglish: {english_text}"
+                })
+                
+                return amharic_text, english_text
 
         # Normalize and embed the query
         normalized_input = detect_language_and_normalize(user_input)
@@ -289,14 +317,21 @@ def chat_with_ai(user_input: str, knowledge_base: list, subject: str, grade: str
         # Combine prompt with context
         combined_prompt = formatted_prompt
         if context:
-            combined_prompt += "\n\nKnowledge Base Excerpt:\n" + context[:2000]  # Increased limit for multiple pages
+            combined_prompt += "\n\nKnowledge Base Excerpt:\n" + context[:2500]  # Increased limit for multiple pages
         else:
             combined_prompt += f"\n\nNote: Knowledge base unavailable. Use general knowledge of {subject} for Grade {grade}."
 
+        # Add explicit instruction for greeting or general queries
+        if user_input.lower().strip() in ["hello", "hi", "what do you know", "what do you know?"]:
+            combined_prompt += f"\n\nUser has sent a greeting or general query. Respond appropriately as an Ethiopian Grade {grade} {subject} teacher while maintaining the required response format with both Amharic and English sections."
+
         # Prepare messages with conversation history
         messages = [{"role": "system", "content": combined_prompt}]
-        for entry in CONVERSATION_HISTORY[-4:]:  # Use last 4 entries for context
+        
+        # Include more conversation history for better context
+        for entry in CONVERSATION_HISTORY[-6:]:  # Use last 6 entries for more context
             messages.append({"role": entry["role"], "content": entry["content"]})
+        
         messages.append({"role": "user", "content": user_input})
 
         # Generate response
@@ -309,18 +344,59 @@ def chat_with_ai(user_input: str, knowledge_base: list, subject: str, grade: str
 
         full_response = response["choices"][0]["message"]["content"].strip()
 
-        # Split Amharic and English parts
-        if "English:" in full_response:
+        # Improved parsing of Amharic and English parts
+        amharic_text = ""
+        english_text = ""
+        
+        # Check for the standard format first
+        if "አማርኛ መልስ፡" in full_response and "English:" in full_response:
             parts = full_response.split("English:", 1)
             amharic_text = parts[0].replace("አማርኛ መልስ፡", "").strip()
             english_text = parts[1].strip()
         else:
-            amharic_text = full_response
-            english_text = full_response
+            # Try alternative formats
+            if "English:" in full_response:
+                # Find where English starts
+                english_start = full_response.find("English:")
+                amharic_text = full_response[:english_start].strip()
+                if "አማርኛ መልስ፡" in amharic_text:
+                    amharic_text = amharic_text.replace("አማርኛ መልስ፡", "").strip()
+                english_text = full_response[english_start+8:].strip()  # +8 for "English:"
+            else:
+                # Check for Ethiopic script
+                ethiopic_pattern = re.compile(r'[\u1200-\u137F]')
+                amharic_lines = []
+                english_lines = []
+                
+                # Process line by line
+                for line in full_response.split('\n'):
+                    # If line contains Ethiopic characters
+                    if ethiopic_pattern.search(line):
+                        amharic_lines.append(line)
+                    # If line is mostly Latin characters
+                    elif re.search(r'[a-zA-Z]', line) and not ethiopic_pattern.search(line):
+                        english_lines.append(line)
+                    # If line has mixed content, determine based on character count
+                    elif line.strip():
+                        ethiopic_count = sum(1 for c in line if '\u1200' <= c <= '\u137F')
+                        latin_count = sum(1 for c in line if c.isascii() and c.isalpha())
+                        if ethiopic_count > latin_count:
+                            amharic_lines.append(line)
+                        else:
+                            english_lines.append(line)
+                
+                amharic_text = ' '.join(amharic_lines).strip()
+                english_text = ' '.join(english_lines).strip()
+                
+                # Fallback if nothing was found
+                if not amharic_text:
+                    amharic_text = "ይቅርታ፣ በአማርኛ መልስ መስጠት አልተቻለም።"
+                if not english_text:
+                    english_text = full_response if full_response else "Sorry, English translation not available."
 
-        # Update conversation history
+        # Update conversation history with the FULL response for better context
         CONVERSATION_HISTORY.append({"role": "user", "content": user_input})
-        CONVERSATION_HISTORY.append({"role": "assistant", "content": amharic_text + "\n(English: " + english_text + ")"})
+        CONVERSATION_HISTORY.append({"role": "assistant", "content": full_response})
 
         while len(CONVERSATION_HISTORY) > MAX_HISTORY:
             CONVERSATION_HISTORY.pop(0)
@@ -330,8 +406,8 @@ def chat_with_ai(user_input: str, knowledge_base: list, subject: str, grade: str
     except Exception as e:
         print(f"OpenAI Error: {str(e)}")
         return (
-            "አማርኛ መልስ፡ ይቅርታ፣ መልሱን መስጠት አልተቻለም። ሌላ ጥያቄ ጠይቅ።",
-            "English: Sorry, unable to provide an answer. Please ask another question."
+            "ይቅርታ፣ መልሱን መስጠት አልተቻለም። ሌላ ጥያቄ ጠይቅ።",
+            "Sorry, unable to provide an answer. Please ask another question."
         )
 
 def record_audio_with_button():
