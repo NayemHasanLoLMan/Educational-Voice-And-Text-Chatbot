@@ -6,6 +6,7 @@ from PIL import Image
 import os
 from dotenv import load_dotenv
 
+
 # Load environment variables
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -135,13 +136,8 @@ def create_ai_step_by_step_solution(file_path=None, user_input=None):
 
 # Example usage
 if __name__ == "__main__":
-    file_path = "C:\\Users\\hasan\\Downloads\\Ethiopia Education Questions Sample Document.pdf"  # Replace with actual file path
+    file_path = "C:\\Users\\hasan\\Downloads\\12th_grade_math_problems.pdf"  # Replace with actual file path
     user_input = """
-    Questions:
-    1. What is the capital city of Ethiopia?
-    2. Solve for x: 2x + 5 = 15
-    
-    Instructions:
-    Analyze the provided content and solve any questions or problems. For mathematical problems, use step-by-step algebraic methods. For theoretical questions, include examples relevant to Ethiopian culture. If no questions are present in the file, summarize the document and suggest educational activities for Ethiopian students in grades 1-12.
+    analyze the document and solve the 12 grade problems in the pdf step by step and give me the solution in a well structured format.
     """
     create_ai_step_by_step_solution(file_path=file_path, user_input=user_input)

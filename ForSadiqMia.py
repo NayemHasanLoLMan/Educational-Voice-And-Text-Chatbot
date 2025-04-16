@@ -653,8 +653,8 @@ def main_api(request_data):
         # Extract common parameters
         mode = request_data.get("mode", "text")
         conversation_history = request_data.get("conversation_history", [])
-        subject = request_data.get("subject", "Amharic")
-        grade = request_data.get("grade", "1")
+        subject = request_data.get("subject", "")
+        grade = request_data.get("grade", "")
         npz_file = request_data.get("npz_file", "")
         
         # Retrieve API keys from environment variables
