@@ -1,603 +1,449 @@
 import openai
-import sounddevice as sd
-import numpy as np
-import wave
 import requests
-import pyttsx3
-import tempfile
-import os
+import pyaudio
+import wave
 import json
+import os
+import pygame
+import tempfile
+import sys
 import time
+import keyboard
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import librosa
-import librosa.display
-import matplotlib.pyplot as plt
+import numpy as np
 import webrtcvad
-from datetime import datetime
 from dotenv import load_dotenv
 
-# Predefined practice sentences at different difficulty levels
-PRACTICE_SENTENCES = {
-    "beginner": [
-        "She walks to the park every morning with her dog.",
-        "I like to eat breakfast before I go to work.",
-        "The weather is nice today so we can go outside."
-    ],
-    "intermediate": [
-        "She walks to the park every morning with her friendly golden retriever.",
-        "The museum had an interesting exhibition about ancient civilizations.",
-        "I believe we should reconsider our approach to solving this problem."
-    ],
-    "advanced": [
-        "The professor eloquently articulated his perspective on the controversial philosophical theory.",
-        "Despite the inclement weather, the determined hikers persevered through the mountainous terrain.",
-        "The intricate relationship between economic policies and environmental sustainability requires nuanced analysis."
-    ]
-}
+# Load environment variables
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# Learning goals for feedback focus
-LEARNING_GOALS = [
-    "Overall improvement",
-    "Grammar focus",
-    "Pronunciation focus",
-    "Fluency focus",
-    "Accent reduction"
-]
+openai.api_key = OPENAI_API_KEY
 
-# Function to initialize text-to-speech engine
-def init_tts_engine():
-    engine = pyttsx3.init()
-    engine.setProperty('rate', 150)
-    engine.setProperty('volume', 0.9)
-    voices = engine.getProperty('voices')
-    if voices:
-        female_voices = [v for v in voices if 'female' in v.name.lower()]
-        if female_voices:
-            engine.setProperty('voice', female_voices[0].id)
-    return engine
+# Audio Recording Settings
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 16000
+CHUNK = 512
+AUDIO_FILENAME = "user_audio.wav"
 
-# Function to speak text using TTS engine with emotion
-def speak_text(text, engine, emotion="neutral"):
-    print(f"🔊 AI: {text}")
-    if emotion == "excited":
-        engine.setProperty('rate', 170)
-        engine.setProperty('volume', 1.0)
-    elif emotion == "calm":
-        engine.setProperty('rate', 130)
-        engine.setProperty('volume', 0.8)
-    elif emotion == "questioning":
-        text = text + "?"
-    engine.say(text)
-    engine.runAndWait()
-    engine.setProperty('rate', 150)
-    engine.setProperty('volume', 0.9)
+# Initialize pygame mixer for audio playback
+pygame.mixer.init()
 
-# Function to record and save audio with countdown
-def record_audio(duration=5, sample_rate=16000):
-    for i in range(3, 0, -1):
-        print(f"{i}...")
-        time.sleep(1)
-    print("🎤 Speak now...")
-    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
-    for i in range(int(duration)):
-        time.sleep(1)
-        print("●" * (i+1) + "○" * (int(duration)-i-1), end="\r")
-    sd.wait()
-    print("\nProcessing your speech...")
-    recording = (recording * 32767).astype(np.int16)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    os.makedirs("user_recordings", exist_ok=True)
-    filename = f"user_recordings/recording_{timestamp}.wav"
-    with wave.open(filename, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(recording.tobytes())
-    print(f"Audio saved as: {filename}")
-    return filename
+# Initialize thread pool for concurrent processing
+executor = ThreadPoolExecutor(max_workers=3)
 
-# Function to transcribe audio using Deepgram with word-level confidence analysis
-def transcribe_audio(audio_file_path, deepgram_api_key):
+# Global variables
+CONVERSATION_HISTORY = []
+MAX_HISTORY = 15
+TTS_CACHE = {}
+
+# Teacher personality and system prompt
+ENGLISH_TEACHER_PROMPT = """
+            You are Sarah, a warm and friendly English conversation partner. Your primary goal is to help learners improve their spoken English by engaging them in natural, flowing, and encouraging conversations that feel like talking to a thoughtful friend.
+
+            As Sarah, you should:
+            1. Lead relaxed, everyday conversations on familiar topics (e.g., hobbies, routines, food, travel, goals, culture).
+            2. Respond in a personal and friendly tone, showing genuine interest in what the student shares.
+            3. Adapt your language based on the student’s level, gradually introducing more advanced vocabulary and sentence structures as the conversation progresses.
+            4. Subtly correct important language mistakes by naturally modeling the correct usage in your next response—never call out or highlight errors directly.
+            5. Ask open-ended, engaging follow-up questions to encourage the student to expand on their thoughts and speak more.
+            6. Keep the conversation flowing smoothly—prioritize natural dialogue over formal instruction.
+            7. Never interrupt with grammar explanations or corrections like “that’s wrong” or “you should say.”
+            8. Use gentle rephrasing or mirroring to guide learners toward more natural and accurate English.
+            9. Always be encouraging, supportive, and positive—make the student feel confident and relaxed.
+            10. After 5–6 exchanges, start using slightly more complex vocabulary, phrasal verbs, or idiomatic expressions, but in a way that’s still accessible.
+            11. If the student seems to struggle, revert to simpler language and topics to ensure they feel comfortable and engaged.
+            12. If the student asks for help with a specific topic, provide a brief, friendly explanation and then return to the conversation.
+            13. Naturally teach vocabulary and phrases through context, examples, and conversation rather than direct instruction.
+            14. Naturally teach grammar and pronunciation through conversation, modeling correct usage without explicit correction.
+            15. If the student seems to be struggling, gently guide them back to simpler language and topics to ensure they feel comfortable and engaged.  
+
+            Remember:
+            - You are a supportive conversation partner, not a traditional teacher.
+            - Avoid formal teaching techniques or grammar lectures.
+            - Your role is to guide learners toward fluency through meaningful, engaging conversation.
+            - Focus on connection, comfort, and consistent improvement through subtle modeling and encouragement.
+"""
+
+# Recording State Management
+class RecordingState:
+    def __init__(self):
+        self.recording = False
+        self.stop_recording = False
+
+recording_state = RecordingState()
+
+# Utility Functions
+def show_progress(message, stop_event):
+    spinner = ['⣾', '⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽']
+    i = 0
+    while not stop_event.is_set():
+        sys.stdout.write(f"\r  {message} {spinner[i % len(spinner)]}   ")
+        sys.stdout.flush()
+        i += 1
+        time.sleep(0.1)
+    sys.stdout.write(f"\r{' ' * (len(message) + 10)}\r")
+    sys.stdout.flush()
+
+def record_audio_with_button():
+    global recording_state
+    print("  Press SPACE to start recording. Press SPACE again to stop.")
+    keyboard.wait('space')
+    print("  Recording started... Press SPACE to stop.")
+    
+    recording_state.recording = True
+    recording_state.stop_recording = False
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    frames = []
+    
+    def stop_on_space():
+        keyboard.wait('space')
+        recording_state.stop_recording = True
+    
+    threading.Thread(target=stop_on_space, daemon=True).start()
+    
+    try:
+        while recording_state.recording and not recording_state.stop_recording:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            frames.append(data)
+    finally:
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
+        recording_state.recording = False
+    
+    if len(frames) > 0:
+        with wave.open(AUDIO_FILENAME, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(audio.get_sample_size(FORMAT))
+            wf.setframerate(RATE)
+            wf.writeframes(b"".join(frames))
+        print("  Recording stopped. Processing...")
+        return AUDIO_FILENAME
+    print("  No audio recorded.")
+    return None
+
+def transcribe_audio(file_path):
     url = "https://api.deepgram.com/v1/listen"
-    headers = {"Authorization": f"Token {deepgram_api_key}"}
+    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/wav"}
     params = {
         "model": "nova-2",
         "language": "en",
         "punctuate": "true",
         "diarize": "false",
-        "detect_language": "true",
-        "utterances": "true",
-        "detect_topics": "true",
-        "summarize": "v2"
+        "detect_language": "true"
     }
-    
     try:
-        with open(audio_file_path, 'rb') as audio:
-            response = requests.post(url, headers=headers, params=params, data=audio)
-        
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            print("  Audio file is missing or empty.")
+            return "", None, []
+        with open(file_path, "rb") as audio_file:
+            response = requests.post(url, headers=headers, params=params, data=audio_file.read())
         if response.status_code == 200:
             result = response.json()
             transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
             confidence = result["results"]["channels"][0]["alternatives"][0]["confidence"]
             words = result["results"]["channels"][0]["alternatives"][0].get("words", [])
-            
-            # Flag low-confidence words as potential mispronunciations
-            potential_errors = [w for w in words if w["confidence"] < 0.9]  # Threshold adjustable
-            if potential_errors:
-                print("Potential pronunciation issues detected in words:", 
-                      [f"{w['word']} (confidence: {w['confidence']:.2f})" for w in potential_errors])
-            
-            return transcript, confidence, audio_file_path, words
-        print(f"Deepgram error: {response.status_code} - {response.text}")
-        return None, None, audio_file_path, []
+            return transcript, confidence, words
+        print(f"  Speech Recognition API Error: {response.status_code}")
+        return "", None, []
     except Exception as e:
-        print(f"Transcription error: {str(e)}")
-        return None, None, audio_file_path, []
+        print(f"  Error during transcription: {str(e)}")
+        return "", None, []
 
-# Function to analyze speech with word-level confidence for pronunciation
-def analyze_speech(reference_text, spoken_text, confidence, audio_file_path, openai_api_key, learning_goal="Overall improvement", learner_level="intermediate", words=[]):
-    openai.api_key = openai_api_key
+def get_tts_audio(text):
+    if text in TTS_CACHE:
+        return TTS_CACHE[text]
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "tts-1", "input": text, "voice": "alloy", "response_format": "mp3", "speed": 1.0}
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": f"""
-                    You are a supportive English teacher who gives clear, personalized feedback. 
-                    Compare the spoken text to the reference text.
-                    Focus primarily on the student's chosen learning goal: {learning_goal}.
-                    The student is at {learner_level} level.
-                    Point out what's good and what needs work in grammar, pronunciation, fluency, and accent. 
-                    Use word-level confidence scores from the 'words' data to identify potential mispronunciations.
-                    If a word has a confidence below 0.9, consider it potentially mispronounced even if it matches the reference.
-                    Suggest simple, actionable ways to improve that are appropriate for their level.
-                    Use the transcription confidence score ({confidence}) to judge overall pronunciation if below 0.95.
-                    For beginners, focus on basic patterns and common mistakes.
-                    For intermediate learners, focus on natural expression and more complex structures.
-                    For advanced learners, focus on subtle nuances, idioms, and native-like fluency.
-                    All scores must be between 0.0 and 1.0 (0% to 100%).
-                """},
-                {"role": "user", "content": f"""
-                    Reference text: "{reference_text}"
-                    Spoken text: "{spoken_text}"
-                    Transcription confidence: {confidence}
-                    Audio file: {audio_file_path}
-                    Word-level data: {json.dumps(words)}
-                    Learning goal: {learning_goal}
-                    Learner level: {learner_level}
-                    
-                    Provide analysis in strict JSON format:
-                    {{
-                        "grammar": {{"errors": [{{"error": "", "correction": "", "explanation": ""}}], "score": 0.0, "feedback": ""}},
-                        "pronunciation": {{"mispronounced_words": [{{"word": "", "issue": "", "suggestion": ""}}], "score": 0.0, "feedback": ""}},
-                        "accent": {{"patterns": [], "feedback": "", "exercises": []}},
-                        "fluency": {{"issues": [], "score": 0.0, "feedback": "", "exercises": []}},
-                        "vocabulary": {{"appropriate": true, "suggestions": [], "feedback": ""}},
-                        "overall": {{"score": 0.0, "strengths": [], "areas_for_improvement": [], "summary": "", "next_steps": []}}
-                    }}
-                """}
-            ],
-            temperature=0.7
-        )
-        content = response.choices[0].message.content.strip()
-        json_start = content.index('{')
-        json_end = content.rindex('}') + 1
-        json_content = content[json_start:json_end]
-        return json.loads(json_content)
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"JSON parsing error: {str(e)} - Response content: {content if 'content' in locals() else 'No content'}")
-        return {
-            "grammar": {"errors": [], "score": 0.5, "feedback": "I couldn't check this fully, but keep practicing!"},
-            "pronunciation": {"mispronounced_words": [], "score": 0.5, "feedback": "Sounded okay, but let's keep working!"},
-            "accent": {"patterns": [], "feedback": "Your style is fine for now!", "exercises": ["Practice with tongue twisters"]},
-            "fluency": {"issues": [], "score": 0.5, "feedback": "You're getting there!", "exercises": ["Read aloud for 5 minutes daily"]},
-            "vocabulary": {"appropriate": True, "suggestions": [], "feedback": "Good word choices!"},
-            "overall": {"score": 0.5, "strengths": ["Trying hard"], "areas_for_improvement": ["Keep practicing"], 
-                        "summary": "Good effort, let's polish it up!", "next_steps": ["Practice daily for 10 minutes"]}
-        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            TTS_CACHE[text] = response.content
+            return response.content
+        print(f"  Text-to-speech API Error: {response.status_code}")
+        return None
     except Exception as e:
-        print(f"API error: {str(e)}")
-        return {"error": "Failed to analyze speech", "message": str(e)}
-
-# Function to analyze audio features with more detailed metrics
-def analyze_audio_features(audio_file_path):
-    y, sr = librosa.load(audio_file_path, sr=None)
-    duration = librosa.get_duration(y=y, sr=sr)
-    f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), 
-                                               fmax=librosa.note_to_hz('C7'), sr=sr)
-    f0_cleaned = f0[~np.isnan(f0)]
-    mean_f0 = np.mean(f0_cleaned) if len(f0_cleaned) > 0 else 0
-    std_f0 = np.std(f0_cleaned) if len(f0_cleaned) > 0 else 0
-    min_f0 = np.min(f0_cleaned) if len(f0_cleaned) > 0 else 0
-    max_f0 = np.max(f0_cleaned) if len(f0_cleaned) > 0 else 0
-    pitch_range = max_f0 - min_f0 if len(f0_cleaned) > 0 else 0
-    rms = librosa.feature.rms(y=y)[0]
-    mean_rms = np.mean(rms)
-    std_rms = np.std(rms)
-    onsets = librosa.onset.onset_detect(y=y, sr=sr, units='time')
-    speech_rate = len(onsets) / duration if len(onsets) > 0 else 0
-    non_silent_intervals = librosa.effects.split(y, top_db=30)
-    silent_intervals = []
-    if len(non_silent_intervals) > 0:
-        for i in range(len(non_silent_intervals) - 1):
-            silent_start = non_silent_intervals[i][1] / sr
-            silent_end = non_silent_intervals[i+1][0] / sr
-            if silent_end - silent_start > 0.2:
-                silent_intervals.append((silent_start, silent_end))
-        if non_silent_intervals[0][0] > 0 and (non_silent_intervals[0][0] / sr) > 0.2:
-            silent_intervals.insert(0, (0, non_silent_intervals[0][0] / sr))
-        if (duration - (non_silent_intervals[-1][1] / sr)) > 0.2:
-            silent_intervals.append((non_silent_intervals[-1][1] / sr, duration))
-    total_pause_time = sum(end - start for start, end in silent_intervals)
-    avg_pause_length = total_pause_time / len(silent_intervals) if silent_intervals else 0
-    segment_durations = [(interval[1] - interval[0]) / sr for interval in non_silent_intervals] if len(non_silent_intervals) > 1 else []
-    rhythm_regularity = 1 - (np.std(segment_durations) / np.mean(segment_durations)) if segment_durations else 0
-    return {
-        "pitch": {"mean": mean_f0, "std": std_f0, "min": min_f0, "max": max_f0, "range": pitch_range},
-        "volume": {"mean": mean_rms, "std": std_rms, "variability": std_rms / mean_rms if mean_rms > 0 else 0},
-        "speech_rate": speech_rate,
-        "pauses": {"count": len(silent_intervals), "total_time": total_pause_time, "average_length": avg_pause_length},
-        "rhythm": {"regularity": rhythm_regularity},
-        "duration": duration
-    }
-
-# Function to visualize audio features
-def visualize_audio_features(audio_file_path, save_path=None, word_timings=None):
-    y, sr = librosa.load(audio_file_path, sr=None)
-    plt.figure(figsize=(12, 10))
-    plt.subplot(4, 1, 1)
-    librosa.display.waveshow(y, sr=sr, alpha=0.6)
-    non_silent_intervals = librosa.effects.split(y, top_db=30)
-    for interval in non_silent_intervals:
-        start = interval[0] / sr
-        end = interval[1] / sr
-        plt.axvspan(start, end, color='green', alpha=0.2)
-    if word_timings:
-        for word in word_timings:
-            plt.axvline(x=word.get('start', 0), color='r', linestyle='--', alpha=0.5)
-            plt.text(word.get('start', 0), max(abs(y))*0.8, word.get('word', ''), rotation=90, fontsize=8)
-    plt.title('Speech Waveform (Green = Speaking)')
-    plt.subplot(4, 1, 2)
-    D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
-    librosa.display.specshow(D, sr=sr, x_axis='time', y_axis='log', cmap='viridis')
-    plt.colorbar(format='%+2.0f dB')
-    plt.title('Spectrogram (Frequency Components)')
-    plt.subplot(4, 1, 3)
-    f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr)
-    times = librosa.times_like(f0, sr=sr)
-    plt.plot(times, f0, label='Pitch', color='b')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Frequency (Hz)')
-    plt.title('Pitch Contour (Melody of Your Voice)')
-    plt.subplot(4, 1, 4)
-    rms = librosa.feature.rms(y=y)[0]
-    frames = range(len(rms))
-    t = librosa.frames_to_time(frames, sr=sr)
-    plt.plot(t, rms, color='orange')
-    plt.title('Volume/Energy Over Time')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Energy')
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
-        return save_path
-    else:
-        plt.show()
+        print(f"  Error in text-to-speech: {str(e)}")
         return None
 
-# Function to analyze voice characteristics
-def analyze_voice_characteristics(audio_features):
-    analysis = {}
-    mean_pitch = audio_features["pitch"]["mean"]
-    if 85 <= mean_pitch <= 180:
-        analysis["voice_type"] = "adult male"
-    elif 165 <= mean_pitch <= 255:
-        analysis["voice_type"] = "adult female"
-    elif mean_pitch > 255:
-        analysis["voice_type"] = "higher pitched"
-    else:
-        analysis["voice_type"] = "lower pitched"
-    pitch_std = audio_features["pitch"]["std"]
-    if pitch_std < 10:
-        analysis["pitch_variation"] = "stays fairly flat (monotone)"
-        analysis["expressiveness_score"] = 0.3
-    elif pitch_std < 30:
-        analysis["pitch_variation"] = "has some natural ups and downs"
-        analysis["expressiveness_score"] = 0.6
-    else:
-        analysis["pitch_variation"] = "is very expressive with good variation"
-        analysis["expressiveness_score"] = 0.9
-    speech_rate = audio_features["speech_rate"]
-    if speech_rate >= 4:
-        analysis["speech_rate"] = "fast"
-        analysis["pace_score"] = 0.7
-    elif 2 <= speech_rate < 4:
-        analysis["speech_rate"] = "at a good conversational pace"
-        analysis["pace_score"] = 0.9
-    else:
-        analysis["speech_rate"] = "somewhat slow and deliberate"
-        analysis["pace_score"] = 0.5
-    pause_count = audio_features["pauses"]["count"]
-    if pause_count < 2:
-        analysis["fluency"] = "smooth with almost no breaks"
-        analysis["fluency_score"] = 0.9
-    elif pause_count <= 5:
-        analysis["fluency"] = "natural with appropriate pauses"
-        analysis["fluency_score"] = 0.8
-    else:
-        analysis["fluency"] = "has several pauses that affect the flow"
-        analysis["fluency_score"] = 0.5
-    if audio_features["volume"]["mean"] < 0.05:
-        analysis["volume"] = "quite soft (could be louder)"
-        analysis["volume_score"] = 0.4
-    elif audio_features["volume"]["mean"] <= 0.1:
-        analysis["volume"] = "at a good level"
-        analysis["volume_score"] = 0.8
-    else:
-        analysis["volume"] = "strong and clear"
-        analysis["volume_score"] = 0.9
-    analysis["brightness"] = "warm and deep" if audio_features["pitch"]["mean"] < 150 else "bright and clear"
-    analysis["rhythm"] = "has a consistent, regular rhythm" if audio_features["rhythm"]["regularity"] > 0.7 else "has a varied, natural rhythm"
-    analysis["overall_voice_score"] = (
-        analysis.get("expressiveness_score", 0.5) +
-        analysis.get("pace_score", 0.5) +
-        analysis.get("fluency_score", 0.5) +
-        analysis.get("volume_score", 0.5)
-    ) / 4
-    analysis["summary"] = f"Your voice sounds like an {analysis['voice_type']}'s, {analysis['pitch_variation']}, and you speak {analysis['speech_rate']} and {analysis['fluency']}. It has a {analysis['brightness']} tone and is {analysis['volume']}."
-    analysis["tips"] = []
-    if analysis.get("expressiveness_score", 0) < 0.6:
-        analysis["tips"].append("Try varying your pitch more when asking questions or expressing emotions")
-    if analysis.get("fluency_score", 0) < 0.7:
-        analysis["tips"].append("Practice reading aloud to reduce pauses between words")
-    if analysis.get("volume_score", 0) < 0.6:
-        analysis["tips"].append("Speak a bit louder to sound more confident")
-    if speech_rate > 4:
-        analysis["tips"].append("Slow down slightly to improve clarity")
-    elif speech_rate < 2:
-        analysis["tips"].append("Try to speak a bit faster to sound more natural")
-    return analysis
-
-# Function to read wave file
-def read_wave(path):
-    with wave.open(path, 'rb') as wf:
-        num_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        pcm_data = wf.readframes(wf.getnframes())
-        return pcm_data, sample_rate
-
-# Function to generate audio frames
-def frame_generator(frame_duration_ms, audio, sample_rate):
-    n = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
-    offset = 0
-    while offset + n < len(audio):
-        yield audio[offset:offset + n]
-        offset += n
-
-# Function to analyze speech activity
-def analyze_speech_activity(file_path, aggressiveness=3):
+def play_audio(audio_data):
+    if not audio_data:
+        return
     try:
-        audio, sample_rate = read_wave(file_path)
-        vad = webrtcvad.Vad(aggressiveness)
-        if sample_rate not in [8000, 16000, 32000, 48000]:
-            return {"speech_segments_count": 0, "error": f"Unsupported sample rate: {sample_rate}"}
-        frame_duration_ms = 30
-        frames = list(frame_generator(frame_duration_ms, audio, sample_rate))
-        if not frames:
-            return {"speech_segments_count": 0, "error": "No frames generated"}
-        valid_frames = [frame for frame in frames if len(frame) >= 640]
-        if not valid_frames:
-            return {"speech_segments_count": 0, "error": "No valid frames after filtering"}
-        voiced_frames = [vad.is_speech(frame, sample_rate) for frame in valid_frames]
-        speech_runs = []
-        current_run = 0
-        for is_speech in voiced_frames:
-            if is_speech:
-                current_run += 1
-            elif current_run > 0:
-                speech_runs.append(current_run)
-                current_run = 0
-        if current_run > 0:
-            speech_runs.append(current_run)
-        total_frames = len(voiced_frames)
-        speech_frames = sum(voiced_frames)
-        speech_percentage = (speech_frames / total_frames) * 100 if total_frames > 0 else 0
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
+        try:
+            pygame.mixer.music.load(temp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+            pygame.mixer.music.unload()
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    except Exception as e:
+        print(f"  Error playing audio: {str(e)}")
+
+def text_to_speech_async(text):
+    future = executor.submit(get_tts_audio, text)
+    def done_callback(future):
+        audio_data = future.result()
+        if audio_data:
+            play_audio(audio_data)
+    future.add_done_callback(done_callback)
+    return future
+
+# Analysis Functions
+def analyze_speech(spoken_text, confidence, words):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": f"""
+                    You are analyzing English speech to help an AI conversation partner. 
+                    Identify: 
+                    1. Up to 3 key grammar or vocabulary errors (if any)
+                    2. Any pronunciation issues based on word confidence scores below 0.6
+                    3. Topic interests of the speaker
+                    4. General fluency level
+                    
+                    Return only JSON:
+                    {{
+                        "errors": [{{"error": "", "correction": ""}}],
+                        "pronunciation": [{{word: "", confidence: 0.0}}],
+                        "interests": ["topic1", "topic2"],
+                        "fluency_impression": ""
+                    }}
+                """},
+                {"role": "user", "content": f"""
+                    Spoken text: "{spoken_text}"
+                    Transcription confidence: {confidence}
+                    Word-level data: {json.dumps(words)}
+                """}
+            ],
+            temperature=0.3
+        )
+        
+        raw_content = response.choices[0].message.content.strip()
+        try:
+            return json.loads(raw_content)
+        except json.JSONDecodeError:
+            return {
+                "errors": [],
+                "pronunciation": [],
+                "interests": ["general conversation"],
+                "fluency_impression": "moderate"
+            }
+    except Exception as e:
+        print(f"  Speech analysis error: {str(e)}")
         return {
-            "speech_segments_count": len(speech_runs) if speech_runs else 0,
-            "speech_percentage": speech_percentage,
-            "average_segment_length": np.mean(speech_runs) if speech_runs else 0,
-            "longest_segment": max(speech_runs) if speech_runs else 0,
-            "shortest_segment": min(speech_runs) if speech_runs else 0
+            "errors": [],
+            "pronunciation": [],
+            "interests": ["general conversation"],
+            "fluency_impression": "moderate"
+        }
+
+def analyze_audio_features(audio_file_path):
+    try:
+        y, sr = librosa.load(audio_file_path, sr=None)
+        duration = librosa.get_duration(y=y, sr=sr)
+        speech_rate = len(librosa.onset.onset_detect(y=y, sr=sr)) / duration if duration > 0 else 0
+        
+        # Use WebRTC VAD to check voice activity
+        vad = webrtcvad.Vad(3)  # Aggressiveness level 3
+        frame_duration = 30  # ms
+        frame_size = int(sr * frame_duration / 1000)
+        vad_frames = []
+        
+        for i in range(0, len(y) - frame_size, frame_size):
+            frame = y[i:i+frame_size]
+            # Convert to PCM16
+            frame_pcm = (frame * 32768).astype(np.int16).tobytes()
+            if len(frame_pcm) == frame_size * 2:  # 2 bytes per sample
+                try:
+                    vad_frames.append(vad.is_speech(frame_pcm, sr))
+                except:
+                    vad_frames.append(False)
+        
+        speech_percentage = sum(vad_frames) / len(vad_frames) if vad_frames else 0
+        
+        return {
+            "duration": duration,
+            "speech_rate": speech_rate,
+            "speech_percentage": speech_percentage
         }
     except Exception as e:
-        print(f"Speech activity analysis error: {str(e)}")
-        return {"speech_segments_count": 0, "error": str(e)}
+        print(f"  Audio feature analysis error: {str(e)}")
+        return {"duration": 0, "speech_rate": 0, "speech_percentage": 0}
 
-# Function to generate personalized progress suggestions
-def generate_progress_suggestions(text_analysis, voice_characteristics):
-    suggestions = []
-    if text_analysis and "grammar" in text_analysis:
-        if text_analysis["grammar"]["score"] < 0.7:
-            suggestions.append({
-                "area": "Grammar", 
-                "tip": "Try simple sentences first. Start with Subject + Verb + Object.",
-                "exercise": "Write 5 simple sentences about your daily routine each day."
-            })
-        elif text_analysis["grammar"]["score"] < 0.9:
-            suggestions.append({
-                "area": "Grammar",
-                "tip": "Practice connecting ideas with words like 'and', 'but', 'because'.",
-                "exercise": "Take a paragraph from a book and rewrite it in your own words."
-            })
-    if "pronunciation" in text_analysis:
-        if text_analysis["pronunciation"]["score"] < 0.7:
-            suggestions.append({
-                "area": "Pronunciation",
-                "tip": "Focus on one sound at a time. Master the 'th' sound first.",
-                "exercise": "Practice saying: 'The three thieves thought thoroughly.'"
-            })
-        elif text_analysis["pronunciation"]["score"] < 0.9:
-            suggestions.append({
-                "area": "Pronunciation",
-                "tip": "Record yourself reading a paragraph and compare to a native speaker.",
-                "exercise": "Shadow speech from a podcast or video - speak along with the recording."
-            })
-    fluency_score = text_analysis.get("fluency", {}).get("score", 0.7)
-    if fluency_score < 0.7:
-        suggestions.append({
-            "area": "Fluency",
-            "tip": "Read aloud for 5 minutes daily, focusing on smooth connections.",
-            "exercise": "Try 'timed reading' - read a short paragraph in 30 seconds, then try again."
-        })
-    elif fluency_score < 0.9:
-        suggestions.append({
-            "area": "Fluency",
-            "tip": "Practice chunking words together in natural phrases.",
-            "exercise": "Record yourself telling a 1-minute story about your day."
-        })
-    if voice_characteristics.get("expressiveness_score", 0.8) < 0.6:
-        suggestions.append({
-            "area": "Expression",
-            "tip": "Exaggerate your intonation when practicing - go higher on questions.",
-            "exercise": "Read dialogue from a book with different character voices."
-        })
-    if len(suggestions) < 2:
-        suggestions.append({
-            "area": "Daily Practice",
-            "tip": "Consistency is key! Even 10 minutes daily is better than an hour once a week.",
-            "exercise": "Set a daily English alarm - when it rings, speak English for 5 minutes."
-        })
-    return suggestions[:3]
-
-# Function to generate personal feedback report
-def generate_proficiency_report(audio_features, voice_characteristics, speech_activity, text_analysis, learning_goal="Overall improvement"):
-    if not text_analysis or "error" in text_analysis:
-        grammar_score = pronunciation_score = fluency_score = 0.7
-        overall_score = 70
-    else:
-        grammar_score = text_analysis.get("grammar", {}).get("score", 0.7)
-        pronunciation_score = text_analysis.get("pronunciation", {}).get("score", 0.7)
-        fluency_score = text_analysis.get("fluency", {}).get("score", 0.7)
-        if learning_goal == "Grammar focus":
-            overall_score = int((grammar_score * 0.5 + pronunciation_score * 0.25 + fluency_score * 0.25) * 100)
-        elif learning_goal == "Pronunciation focus":
-            overall_score = int((grammar_score * 0.25 + pronunciation_score * 0.5 + fluency_score * 0.25) * 100)
-        elif learning_goal == "Fluency focus":
-            overall_score = int((grammar_score * 0.25 + pronunciation_score * 0.25 + fluency_score * 0.5) * 100)
-        else:
-            overall_score = int((grammar_score + pronunciation_score + fluency_score) / 3 * 100)
-    overall_score = min(overall_score, 100)
-    progress_suggestions = generate_progress_suggestions(text_analysis, voice_characteristics)
-    report = {
-        "overall": {
-            "score": overall_score,
-            "summary": text_analysis["overall"]["summary"] if text_analysis and "overall" in text_analysis else "You're making good progress!",
-            "learning_goal": learning_goal,
-            "next_steps": text_analysis.get("overall", {}).get("next_steps", ["Keep practicing regularly"])
-        },
-        "grammar": {
-            "good": text_analysis["grammar"]["feedback"] if text_analysis and "grammar" in text_analysis and grammar_score > 0.8 else "You're working hard on your sentence structure!",
-            "work": ", ".join([f"'{err['error']}' → '{err['correction']}' ({err['explanation']})" for err in text_analysis["grammar"]["errors"]]) if text_analysis and "grammar" in text_analysis and text_analysis["grammar"]["errors"] else "Focus on subject-verb agreement and tenses",
-            "tip": "Try writing down what you want to say before speaking it."
-        },
-        "pronunciation": {
-            "good": "Your pronunciation is clear and understandable!" if text_analysis and "pronunciation" in text_analysis and pronunciation_score > 0.8 else "I can understand what you're saying!",
-            "work": "speaking too quickly" if audio_features['speech_rate'] > 5 else "" + (", ".join([f"'{w['word']}' - {w['suggestion']}" for w in text_analysis["pronunciation"]["mispronounced_words"]]) if text_analysis and "pronunciation" in text_analysis and text_analysis["pronunciation"]["mispronounced_words"] else ""),
-            "tip": "Slow down and stress important words." if audio_features['speech_rate'] > 5 else "Record yourself and compare with native speakers."
-        },
-        "fluency": {
-            "good": f"You speak with natural flow in {speech_activity.get('speech_segments_count', 0)} segments!",
-            "work": "try connecting your thoughts more smoothly" if speech_activity.get('speech_segments_count', 0) > 6 else "",
-            "tip": "Practice 'linking'"
-        },
-        "voice": {
-            "description": voice_characteristics.get("summary", "Your voice has good qualities for English speaking."),
-            "tips": voice_characteristics.get("tips", ["Practice speaking with more expression"])
-        },
-        "suggestions": progress_suggestions
+def generate_conversation_context(audio_analysis, audio_features, exchanges):
+    """Creates context for the AI to generate appropriate responses"""
+    complexity_level = min(1 + (exchanges // 5), 5)  # Gradually increase complexity
+    
+    errors = audio_analysis.get("errors", [])
+    pronunciation = audio_analysis.get("pronunciation", [])
+    interests = audio_analysis.get("interests", ["general topics"])
+    fluency = audio_analysis.get("fluency_impression", "moderate")
+    
+    context = {
+        "complexity_level": complexity_level,  # 1-5 scale
+        "errors_to_address": errors[:2],  # Limit to addressing just 2 errors
+        "pronunciation_issues": pronunciation[:2],
+        "interests": interests,
+        "fluency_impression": fluency,
+        "speech_rate": audio_features.get("speech_rate", 0),
+        "speech_percentage": audio_features.get("speech_percentage", 0),
+        "exchanges": exchanges
     }
-    return report
+    
+    return context
 
-# Main function
-def main():
-    load_dotenv()
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
-    if not openai_api_key or not deepgram_api_key:
-        print("Error: Missing API keys. Please set OPENAI_API_KEY and DEEPGRAM_API_KEY in your environment variables.")
-        return
-    tts_engine = init_tts_engine()
-    print("\n🌟 Welcome to English Speaking Practice Assistant! 🌟")
-    print("\nSelect your English level:")
-    for i, level in enumerate(["beginner", "intermediate", "advanced"]):
-        print(f"{i+1}. {level.capitalize()}")
-    level_choice = input("Enter the number (1-3) or press Enter for intermediate: ")
-    learner_level = ["beginner", "intermediate", "advanced"][int(level_choice) - 1] if level_choice.isdigit() and 1 <= int(level_choice) <= 3 else "intermediate"
-    print("\nWhat would you like to focus on improving?")
-    for i, goal in enumerate(LEARNING_GOALS):
-        print(f"{i+1}. {goal}")
-    goal_choice = input("Enter the number (1-5) or press Enter for overall improvement: ")
-    learning_goal = LEARNING_GOALS[int(goal_choice) - 1] if goal_choice.isdigit() and 1 <= int(goal_choice) <= len(LEARNING_GOALS) else "Overall improvement"
-    print(f"\nHere are some practice sentences for {learner_level} level:")
-    for i, sentence in enumerate(PRACTICE_SENTENCES[learner_level]):
-        print(f"{i+1}. {sentence}")
-    choice = input("\nEnter the number to practice one of these sentences, or type your own: ")
-    if choice.isdigit() and 1 <= int(choice) <= len(PRACTICE_SENTENCES[learner_level]):
-        reference_text = PRACTICE_SENTENCES[learner_level][int(choice) - 1]
-    else:
-        reference_text = choice
-    print("\n📢 Listen to this sentence:")
-    speak_text(reference_text, tts_engine)
-    print("\nNow it's your turn to practice. I'll record your speech.")
-    record_duration = 15
-    audio_file_path = record_audio(duration=record_duration)
-    print("Analyzing your speech...")
-    transcript, confidence, _, word_timings = transcribe_audio(audio_file_path, deepgram_api_key)
-    if not transcript:
-        print("❌ Error: Could not transcribe your speech. Please try again.")
-        speak_text("I couldn't hear that clearly. Let's try again.", tts_engine, emotion="calm")
-        return
-    print(f"📝 You said: '{transcript}'")
-    audio_features = analyze_audio_features(audio_file_path)
-    speech_activity = analyze_speech_activity(audio_file_path)
-    voice_characteristics = analyze_voice_characteristics(audio_features)
-    text_analysis = analyze_speech(reference_text, transcript, confidence, audio_file_path, 
-                                  openai_api_key, learning_goal, learner_level, word_timings)
-    report = generate_proficiency_report(audio_features, voice_characteristics, 
-                                        speech_activity, text_analysis, learning_goal)
-    visualization_path = os.path.join("user_recordings", f"visualization_{os.path.basename(audio_file_path).split('.')[0]}.png")
-    visualize_audio_features(audio_file_path, save_path=visualization_path, word_timings=word_timings)
-    print("\n📊 Your Speech Analysis Results:")
-    print(f"Overall Score: {report['overall']['score']}/100")
-    print(f"Summary: {report['overall']['summary']}")
-    print("\n🔤 Grammar:")
-    print(f"Strengths: {report['grammar']['good']}")
-    if report['grammar']['work']:
-        print(f"Areas to work on: {report['grammar']['work']}")
-    print("\n🗣️ Pronunciation:")
-    print(f"Strengths: {report['pronunciation']['good']}")
-    if report['pronunciation']['work']:
-        print(f"Areas to work on: {report['pronunciation']['work']}")
-    print("\n🌊 Fluency:")
-    print(f"Strengths: {report['fluency']['good']}")
-    if report['fluency']['work']:
-        print(f"Areas to work on: {report['fluency']['work']}")
-    print("\n🎵 Voice characteristics:")
-    print(report['voice']['description'])
-    print("\n📈 Personalized suggestions for improvement:")
-    for i, suggestion in enumerate(report['suggestions']):
-        print(f"{i+1}. {suggestion['area']}: {suggestion['tip']}")
-        print(f"   Exercise: {suggestion['exercise']}")
-    if report['overall']['score'] >= 85:
-        speak_text("Excellent job! Your English speaking is very good.", tts_engine, emotion="excited")
-    elif report['overall']['score'] >= 70:
-        speak_text("Good work! You're making great progress with your English.", tts_engine, emotion="excited")
-    else:
-        speak_text("Thanks for practicing! Keep working on your English - you're improving!", tts_engine, emotion="calm")
-    print("\nWould you like to practice again? (y/n)")
-    if input().lower().startswith('y'):
-        main()
-    else:
-        print("Thank you for practicing! Keep up the good work with your English learning!")
+def chat_with_english_partner(user_input, audio_file, confidence, words, exchanges):
+    """Main function to generate AI responses"""
+    # Analyze speech and audio
+    audio_analysis = analyze_speech(user_input, confidence, words)
+    audio_features = analyze_audio_features(audio_file)
+    
+    # Generate context for the AI
+    context = generate_conversation_context(audio_analysis, audio_features, exchanges)
+    
+    # Build messages for the language model
+    messages = [{"role": "system", "content": ENGLISH_TEACHER_PROMPT}]
+    
+    # Add context info for the AI
+    context_message = f"""
+    Conversation info (invisible to user):
+    - Exchanges: {context['exchanges']}
+    - Complexity level: {context['complexity_level']}/5
+    - User errors: {json.dumps(context['errors_to_address'])}
+    - Pronunciation issues: {json.dumps(context['pronunciation_issues'])}
+    - User interests: {', '.join(context['interests'])}
+    - Fluency impression: {context['fluency_impression']}
+    
+    Guidance:
+    - Respond naturally to what they said
+    - If they made grammar errors, subtly model the correct form in your response
+    - Aim for natural correction through modeling, not explicit teaching
+    - Ask engaging follow-up questions
+    - Complexity should match level {context['complexity_level']}
+    """
+    messages.append({"role": "system", "content": context_message})
+    
+    # Add conversation history
+    for entry in CONVERSATION_HISTORY:
+        messages.append({"role": entry["role"], "content": entry["content"]})
+    
+    # Add user's latest input
+    messages.append({"role": "user", "content": user_input})
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            max_tokens=1500,
+            temperature=0.7
+        )
+        assistant_response = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"  API Error: {str(e)}")
+        assistant_response = "I'm sorry, I didn't catch that. Could you say it again, please?"
+    
+    # Update conversation history
+    CONVERSATION_HISTORY.append({"role": "user", "content": user_input})
+    CONVERSATION_HISTORY.append({"role": "assistant", "content": assistant_response})
+    
+    # Keep history size manageable
+    if len(CONVERSATION_HISTORY) > MAX_HISTORY:
+        CONVERSATION_HISTORY.pop(0)
+        CONVERSATION_HISTORY.pop(0)
+    
+    return assistant_response
+
+def start_english_conversation():
+    """Main function to run the conversation agent"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("\n" + "="*70)
+    print("  English Conversation Practice")
+    print("  Press ESC at any time to exit")
+    print("="*70)
+    print("\n  Let's start a conversation!\n")
+    
+    exchanges = 0
+    
+    # Initial greeting to start conversation
+    initial_greeting = "Hi there! I'm Sarah. It's nice to meet you! How are you doing today?"
+    print(f"  Sarah: {initial_greeting}")
+    initial_audio = text_to_speech_async(initial_greeting)
+    
+    try:
+        while True:
+            if keyboard.is_pressed('esc'):
+                print("\n  Sarah: It was nice talking with you! Hope to chat again soon!")
+                end_audio = text_to_speech_async("It was nice talking with you! Hope to chat again soon!")
+                end_audio.result()
+                break
+            
+            audio_file = record_audio_with_button()
+            if not audio_file:
+                print("  Sarah: I didn't hear anything. Let's try again!")
+                text_to_speech_async("I didn't hear anything. Let's try again!")
+                continue
+            
+            stop_event = threading.Event()
+            progress_thread = threading.Thread(target=show_progress, args=("Processing speech", stop_event))
+            progress_thread.start()
+            user_input, confidence, words = transcribe_audio(audio_file)
+            stop_event.set()
+            progress_thread.join()
+            
+            if not user_input:
+                print("  Sarah: Sorry, I didn't catch that. Could you say it again?")
+                text_to_speech_async("Sorry, I didn't catch that. Could you say it again?")
+                continue
+            
+            print(f"  You: {user_input}")
+            
+            stop_event = threading.Event()
+            progress_thread = threading.Thread(target=show_progress, args=("Sarah is thinking", stop_event))
+            progress_thread.start()
+            response = chat_with_english_partner(user_input, audio_file, confidence, words, exchanges)
+            stop_event.set()
+            progress_thread.join()
+            
+            print(f"  Sarah: {response}")
+            text_to_speech_async(response)
+            
+            exchanges += 1
+            
+            # Clean up audio file
+            if os.path.exists(audio_file):
+                os.remove(audio_file)
+    
+    except KeyboardInterrupt:
+        print("\n  Conversation ended. Thanks for practicing!")
+        farewell = "Thanks for practicing English with me! Goodbye!"
+        print(f"  Sarah: {farewell}")
+        farewell_audio = text_to_speech_async(farewell)
+        farewell_audio.result()
+    
+    except Exception as e:
+        print(f"  Unexpected error: {str(e)}")
+    
+    finally:
+        initial_audio.result()
+        executor.shutdown(wait=True)
+        pygame.mixer.quit()
 
 if __name__ == "__main__":
-    main()
+    try:
+        start_english_conversation()
+    except Exception as e:
+        print(f"  Fatal error: {str(e)}")
