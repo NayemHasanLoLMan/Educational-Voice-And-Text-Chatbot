@@ -5,7 +5,7 @@
 🎓 Subject-Wise AI Chatbot
 Custom chatbot for each subject and grade (1–12).
 
-Supports English and Aharmic (bi-lingual).
+Supports English and Aharmic (bilingual).
 
 Powered by OpenAI models and optimized for student interaction.
 
