@@ -176,3 +176,7 @@ cython_debug/
 
 # Language detection model
 lid.176.bin
+
+
+
+pdfs/
